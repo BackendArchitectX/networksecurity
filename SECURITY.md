@@ -53,4 +53,4 @@ The API enforces request-size limits on the actual ASGI byte stream, including c
 
 ## Data handling
 
-The included dataset is used as an engineering workload. Do not ingest sensitive production data into this reference deployment without defining retention, access control, encryption, deletion and audit requirements appropriate to that data.
+Raw training data is intentionally not redistributed in this repository because the historical CSV's provenance and redistribution terms were not documented sufficiently. Supply only data that you are permitted to use, and define retention, access control, encryption, deletion and audit requirements appropriate to that data. See `docs/DATASET.md` for the expected schema and ingestion contract.
