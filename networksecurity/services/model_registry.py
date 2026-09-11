@@ -201,12 +201,14 @@ class ModelRegistry:
         pointer = _read_json(self._current)
         version = pointer.get("version")
         manifest = pointer.get("manifest")
-        promotion_token = pointer.get("promotion_token")
+        # Pointers created before fencing existed are treated as generation zero so
+        # the first fenced promotion can migrate them in place without downtime.
+        promotion_token = pointer.get("promotion_token", 0)
         if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
             raise ModelIntegrityError("current model pointer contains an invalid version")
         if not isinstance(manifest, str):
             raise ModelIntegrityError("current model pointer is missing manifest path")
-        if not isinstance(promotion_token, int) or promotion_token < 1:
+        if not isinstance(promotion_token, int) or promotion_token < 0:
             raise ModelIntegrityError("current model pointer contains an invalid promotion token")
         self._safe_registry_path(manifest)
         return {
