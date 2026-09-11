@@ -77,6 +77,22 @@ class TrainingJobStore:
             parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    def ensure_fence_at_least(self, value: int) -> None:
+        """Prevent fence-token reuse after restoring/recreating the job database."""
+        if value < 0:
+            raise ValueError("fence value cannot be negative")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE training_job_fence
+                SET value = CASE WHEN value < ? THEN ? ELSE value END
+                WHERE singleton = 1
+                """,
+                (value, value),
+            )
+            connection.commit()
+
     def submit(self, idempotency_key: str) -> tuple[TrainingJob, bool]:
         now = _utc_now()
         with self._connect() as connection:
@@ -254,7 +270,7 @@ class TrainingJobStore:
 
         The SQLite write transaction intentionally remains open during the small local
         pointer swap. `claim_next` also requires `BEGIN IMMEDIATE`, so another worker
-        cannot reclaim the job between the lease check and pointer promotion.
+        cannot reclaim the job between that ownership check and pointer promotion.
         """
         now = _utc_now()
         with self._connect() as connection:
@@ -276,8 +292,6 @@ class TrainingJobStore:
                   AND state = ?
                   AND worker_id = ?
                   AND fence_token = ?
-                  AND lease_until IS NOT NULL
-                  AND lease_until > ?
                 """,
                 (
                     TrainingJobState.SUCCEEDED.value,
@@ -287,12 +301,11 @@ class TrainingJobStore:
                     TrainingJobState.RUNNING.value,
                     worker_id,
                     fence_token,
-                    now,
                 ),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
-                raise TrainingJobLeaseError("training job lease changed during promotion")
+                raise TrainingJobLeaseError("training job ownership changed during promotion")
             connection.commit()
             return result
 
