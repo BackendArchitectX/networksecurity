@@ -6,7 +6,10 @@ from enum import Enum
 from pathlib import Path
 import sqlite3
 import uuid
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+
+T = TypeVar("T")
 
 
 class TrainingQueueFullError(RuntimeError):
@@ -36,6 +39,7 @@ class TrainingJob:
     worker_id: str | None = None
     lease_until: str | None = None
     attempts: int = 0
+    fence_token: int | None = None
     model_version: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,13 +49,13 @@ class TrainingJob:
 
 
 class TrainingJobStore:
-    """Durable single-active-job queue with idempotency and lease recovery.
+    """Durable single-active-job queue with leases and fencing tokens.
 
-    SQLite is deliberately used as a reference durable store: API and worker may run
-    in separate processes, duplicate submissions survive restarts, and abandoned
-    RUNNING jobs can be reclaimed after their lease expires. `claim_next` enforces a
-    single active training job across all workers so publication to the shared model
-    registry has single-writer semantics.
+    Every successful claim receives a globally monotonic fence token. Lease-sensitive
+    mutations require the exact `(job_id, worker_id, fence_token)` tuple and a lease
+    that is still live. Promotion is executed while `BEGIN IMMEDIATE` holds the
+    control-plane write lock, so a job cannot be reclaimed while its pointer update
+    is being committed.
     """
 
     def __init__(
@@ -129,8 +133,6 @@ class TrainingJobStore:
             connection.execute("BEGIN IMMEDIATE")
             self._reclaim_expired_jobs(connection, now)
 
-            # A shared filesystem registry is deliberately single-writer. Multiple
-            # worker processes may compete for work, but only one may train/publish.
             running = connection.execute(
                 "SELECT 1 FROM training_jobs WHERE state = ? LIMIT 1",
                 (TrainingJobState.RUNNING.value,),
@@ -152,15 +154,25 @@ class TrainingJobStore:
                 connection.commit()
                 return None
 
-            job_id = row["job_id"]
             connection.execute(
+                "UPDATE training_job_fence SET value = value + 1 WHERE singleton = 1"
+            )
+            fence_token = int(
+                connection.execute(
+                    "SELECT value FROM training_job_fence WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+
+            job_id = row["job_id"]
+            cursor = connection.execute(
                 """
                 UPDATE training_jobs
                 SET state = ?,
                     started_at = COALESCE(started_at, ?),
                     worker_id = ?,
                     lease_until = ?,
-                    attempts = attempts + 1
+                    attempts = attempts + 1,
+                    fence_token = ?
                 WHERE job_id = ? AND state = ?
                 """,
                 (
@@ -168,10 +180,15 @@ class TrainingJobStore:
                     now,
                     worker_id,
                     lease_until,
+                    fence_token,
                     job_id,
                     TrainingJobState.QUEUED.value,
                 ),
             )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise TrainingJobLeaseError("training job could not be claimed")
+
             claimed = connection.execute(
                 "SELECT * FROM training_jobs WHERE job_id = ?",
                 (job_id,),
@@ -179,43 +196,167 @@ class TrainingJobStore:
             connection.commit()
             return _row_to_job(claimed)
 
-    def heartbeat(self, job_id: str, worker_id: str, lease_seconds: int) -> None:
+    def heartbeat(
+        self,
+        job_id: str,
+        worker_id: str,
+        fence_token: int,
+        lease_seconds: int,
+    ) -> None:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        now = _utc_now()
         lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE training_jobs
                 SET lease_until = ?
-                WHERE job_id = ? AND state = ? AND worker_id = ?
+                WHERE job_id = ?
+                  AND state = ?
+                  AND worker_id = ?
+                  AND fence_token = ?
+                  AND lease_until IS NOT NULL
+                  AND lease_until > ?
                 """,
-                (lease_until, job_id, TrainingJobState.RUNNING.value, worker_id),
+                (
+                    lease_until,
+                    job_id,
+                    TrainingJobState.RUNNING.value,
+                    worker_id,
+                    fence_token,
+                    now,
+                ),
             )
             if cursor.rowcount != 1:
-                raise TrainingJobLeaseError("worker no longer owns training job lease")
+                raise TrainingJobLeaseError("worker no longer owns a live training job lease")
 
-    def succeed(self, job_id: str, worker_id: str, model_version: str) -> None:
+    def fail(self, job_id: str, worker_id: str, fence_token: int, error: str) -> None:
         self._finish(
             job_id=job_id,
             worker_id=worker_id,
-            state=TrainingJobState.SUCCEEDED,
-            error=None,
-            model_version=model_version,
-        )
-
-    def fail(self, job_id: str, worker_id: str, error: str) -> None:
-        self._finish(
-            job_id=job_id,
-            worker_id=worker_id,
+            fence_token=fence_token,
             state=TrainingJobState.FAILED,
             error=error[:2048],
             model_version=None,
         )
 
+    def promote_owned(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        fence_token: int,
+        promote: Callable[[int], T],
+        model_version: str,
+    ) -> T:
+        """Promote while lease ownership is fenced against concurrent reclaim.
+
+        The SQLite write transaction intentionally remains open during the small local
+        pointer swap. `claim_next` also requires `BEGIN IMMEDIATE`, so another worker
+        cannot reclaim the job between the lease check and pointer promotion.
+        """
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM training_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            self._assert_live_owner(row, worker_id, fence_token, now)
+
+            result = promote(fence_token)
+
+            cursor = connection.execute(
+                """
+                UPDATE training_jobs
+                SET state = ?, finished_at = ?, error = NULL, model_version = ?,
+                    worker_id = NULL, lease_until = NULL
+                WHERE job_id = ?
+                  AND state = ?
+                  AND worker_id = ?
+                  AND fence_token = ?
+                  AND lease_until IS NOT NULL
+                  AND lease_until > ?
+                """,
+                (
+                    TrainingJobState.SUCCEEDED.value,
+                    _utc_now(),
+                    model_version,
+                    job_id,
+                    TrainingJobState.RUNNING.value,
+                    worker_id,
+                    fence_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise TrainingJobLeaseError("training job lease changed during promotion")
+            connection.commit()
+            return result
+
+    def _finish(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        fence_token: int,
+        state: TrainingJobState,
+        error: str | None,
+        model_version: str | None,
+    ) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE training_jobs
+                SET state = ?, finished_at = ?, error = ?, model_version = ?,
+                    worker_id = NULL, lease_until = NULL
+                WHERE job_id = ?
+                  AND state = ?
+                  AND worker_id = ?
+                  AND fence_token = ?
+                  AND lease_until IS NOT NULL
+                  AND lease_until > ?
+                """,
+                (
+                    state.value,
+                    now,
+                    error,
+                    model_version,
+                    job_id,
+                    TrainingJobState.RUNNING.value,
+                    worker_id,
+                    fence_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TrainingJobLeaseError("worker no longer owns a live training job lease")
+
+    @staticmethod
+    def _assert_live_owner(
+        row: sqlite3.Row | None,
+        worker_id: str,
+        fence_token: int,
+        now: str,
+    ) -> None:
+        if row is None:
+            raise TrainingJobLeaseError("training job does not exist")
+        if row["state"] != TrainingJobState.RUNNING.value:
+            raise TrainingJobLeaseError("training job is not running")
+        if row["worker_id"] != worker_id or row["fence_token"] != fence_token:
+            raise TrainingJobLeaseError("worker does not own the training job fence")
+        if row["lease_until"] is None or row["lease_until"] <= now:
+            raise TrainingJobLeaseError("training job lease has expired")
+
     def _reclaim_expired_jobs(self, connection: sqlite3.Connection, now: str) -> None:
         connection.execute(
             """
             UPDATE training_jobs
-            SET state = ?, finished_at = ?, error = ?, worker_id = NULL, lease_until = NULL
+            SET state = ?, finished_at = ?, error = ?, worker_id = NULL,
+                lease_until = NULL, fence_token = NULL
             WHERE state = ? AND lease_until IS NOT NULL AND lease_until <= ? AND attempts >= ?
             """,
             (
@@ -230,7 +371,7 @@ class TrainingJobStore:
         connection.execute(
             """
             UPDATE training_jobs
-            SET state = ?, worker_id = NULL, lease_until = NULL
+            SET state = ?, worker_id = NULL, lease_until = NULL, fence_token = NULL
             WHERE state = ? AND lease_until IS NOT NULL AND lease_until <= ? AND attempts < ?
             """,
             (
@@ -240,36 +381,6 @@ class TrainingJobStore:
                 self._max_attempts,
             ),
         )
-
-    def _finish(
-        self,
-        *,
-        job_id: str,
-        worker_id: str,
-        state: TrainingJobState,
-        error: str | None,
-        model_version: str | None,
-    ) -> None:
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE training_jobs
-                SET state = ?, finished_at = ?, error = ?, model_version = ?,
-                    worker_id = NULL, lease_until = NULL
-                WHERE job_id = ? AND state = ? AND worker_id = ?
-                """,
-                (
-                    state.value,
-                    _utc_now(),
-                    error,
-                    model_version,
-                    job_id,
-                    TrainingJobState.RUNNING.value,
-                    worker_id,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise TrainingJobLeaseError("worker no longer owns training job lease")
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -286,14 +397,26 @@ class TrainingJobStore:
                     worker_id TEXT,
                     lease_until TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    fence_token INTEGER,
                     model_version TEXT
                 );
+                CREATE TABLE IF NOT EXISTS training_job_fence (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    value INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO training_job_fence(singleton, value) VALUES (1, 0);
                 CREATE INDEX IF NOT EXISTS idx_training_jobs_state_submitted
                     ON training_jobs(state, submitted_at);
                 CREATE INDEX IF NOT EXISTS idx_training_jobs_lease
                     ON training_jobs(state, lease_until);
                 """
             )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(training_jobs)").fetchall()
+            }
+            if "fence_token" not in columns:
+                connection.execute("ALTER TABLE training_jobs ADD COLUMN fence_token INTEGER")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=5.0)
@@ -305,6 +428,7 @@ class TrainingJobStore:
 
 
 def _row_to_job(row: sqlite3.Row) -> TrainingJob:
+    fence_token = row["fence_token"]
     return TrainingJob(
         job_id=row["job_id"],
         idempotency_key=row["idempotency_key"],
@@ -316,6 +440,7 @@ def _row_to_job(row: sqlite3.Row) -> TrainingJob:
         worker_id=row["worker_id"],
         lease_until=row["lease_until"],
         attempts=int(row["attempts"]),
+        fence_token=None if fence_token is None else int(fence_token),
         model_version=row["model_version"],
     )
 
