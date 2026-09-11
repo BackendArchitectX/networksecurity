@@ -55,7 +55,7 @@ class TrainingPipeline:
         config = ModelTrainerConfig(self.training_pipeline_config)
         return ModelTrainer(config, artifact).initiate_model_trainer()
 
-    def publish_model(
+    def stage_model(
         self,
         trainer: ModelTrainerArtifact,
         transformation: DataTransformationArtifact,
@@ -69,13 +69,42 @@ class TrainingPipeline:
                 "feature_names": list(self.schema_registry.feature_names),
             }
         )
-        return self.model_registry.publish(
+        return self.model_registry.stage(
             model_source=trainer.trained_model_file_path,
             preprocessor_source=transformation.transformed_object_file_path,
             metadata=metadata,
         )
 
-    def _sync_outputs_if_configured(self, bundle: ModelBundle) -> None:
+    def prepare_candidate(self) -> TrainingPipelineArtifact:
+        """Train and stage an immutable candidate without changing production."""
+        try:
+            logging.info("training candidate build started")
+            ingestion = self.start_data_ingestion()
+            validation = self.start_data_validation(ingestion)
+            transformation = self.start_data_transformation(validation)
+            trainer = self.start_model_trainer(transformation)
+            bundle = self.stage_model(trainer, transformation)
+            logging.info("training candidate staged", extra={"model_version": bundle.version})
+            return TrainingPipelineArtifact(
+                model_version=bundle.version,
+                manifest_path=bundle.manifest_path,
+                model_trainer_artifact=trainer,
+            )
+        except Exception as exc:
+            raise NetworkSecurityException(exc, sys) from exc
+
+    def promote_candidate(
+        self,
+        candidate: TrainingPipelineArtifact,
+        promotion_token: int,
+    ) -> ModelBundle:
+        return self.model_registry.promote(
+            candidate.model_version,
+            promotion_token=promotion_token,
+        )
+
+    def mirror_promoted(self, bundle: ModelBundle) -> None:
+        """Mirror an already-authoritative local release; S3 is not serving authority."""
         if not TRAINING_BUCKET_NAME:
             logging.info("training bucket is not configured; skipping cloud artifact sync")
             return
@@ -84,27 +113,7 @@ class TrainingPipeline:
         version_uri = f"s3://{TRAINING_BUCKET_NAME}/model_registry/versions/{bundle.version}"
         self.s3_sync.sync_folder_to_s3(self.training_pipeline_config.artifact_dir, artifact_uri)
         self.s3_sync.sync_folder_to_s3(str(Path(bundle.manifest_path).parent), version_uri)
-
-        # Publish the remote pointer last so consumers never observe an incomplete bundle.
         self.s3_sync.upload_file(
             self.model_registry.current_pointer_path,
             f"s3://{TRAINING_BUCKET_NAME}/model_registry/current.json",
         )
-
-    def run_pipeline(self) -> TrainingPipelineArtifact:
-        try:
-            logging.info("training pipeline started")
-            ingestion = self.start_data_ingestion()
-            validation = self.start_data_validation(ingestion)
-            transformation = self.start_data_transformation(validation)
-            trainer = self.start_model_trainer(transformation)
-            bundle = self.publish_model(trainer, transformation)
-            self._sync_outputs_if_configured(bundle)
-            logging.info("training pipeline completed", extra={"model_version": bundle.version})
-            return TrainingPipelineArtifact(
-                model_version=bundle.version,
-                manifest_path=bundle.manifest_path,
-                model_trainer_artifact=trainer,
-            )
-        except Exception as exc:
-            raise NetworkSecurityException(exc, sys) from exc
