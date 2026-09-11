@@ -6,12 +6,21 @@ from networksecurity.services.training_worker import TrainingWorker
 
 
 class FakePipeline:
-    def run_pipeline(self):
+    def __init__(self):
+        self.mirrored = []
+
+    def prepare_candidate(self):
         return SimpleNamespace(model_version="published-v3")
+
+    def promote_candidate(self, candidate, promotion_token):
+        return SimpleNamespace(version=candidate.model_version, promotion_token=promotion_token)
+
+    def mirror_promoted(self, bundle):
+        self.mirrored.append(bundle.version)
 
 
 class FailingPipeline:
-    def run_pipeline(self):
+    def prepare_candidate(self):
         raise RuntimeError("synthetic training failure")
 
 
@@ -28,11 +37,12 @@ def test_worker_claims_persisted_job_and_records_published_version(tmp_path):
     settings = _settings(tmp_path)
     store = TrainingJobStore(settings.training_job_db_path)
     submitted, _ = store.submit("worker-integration-request")
+    pipeline = FakePipeline()
 
     worker = TrainingWorker(
         settings,
         worker_id="worker-test",
-        pipeline_factory=FakePipeline,
+        pipeline_factory=lambda: pipeline,
     )
     assert worker.worker_id == "worker-test"
     assert worker.run_once() is True
@@ -41,7 +51,9 @@ def test_worker_claims_persisted_job_and_records_published_version(tmp_path):
     assert completed is not None
     assert completed.state == TrainingJobState.SUCCEEDED
     assert completed.attempts == 1
+    assert completed.fence_token == 1
     assert completed.model_version == "published-v3"
+    assert pipeline.mirrored == ["published-v3"]
 
 
 def test_worker_returns_false_when_queue_is_empty(tmp_path):
@@ -70,5 +82,6 @@ def test_worker_records_pipeline_failure_without_losing_job_state(tmp_path):
     assert failed is not None
     assert failed.state == TrainingJobState.FAILED
     assert failed.attempts == 1
+    assert failed.fence_token == 1
     assert failed.model_version is None
     assert failed.error == "RuntimeError: synthetic training failure"
