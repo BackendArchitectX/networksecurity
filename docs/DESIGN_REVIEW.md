@@ -32,30 +32,35 @@ Why SQLite here: it is enough to demonstrate restart-safe durability, uniqueness
 
 Production evolution: persist job/idempotency state in PostgreSQL or another transactional store and execute work through SQS, Kafka, a managed task system or equivalent. The HTTP idempotency contract can remain unchanged.
 
-## 3. Worker leases and crash recovery
+## 3. Worker leases, fencing and crash recovery
 
-**Invariant:** a worker owns a training job only while its lease is valid. Dead workers do not leave work permanently stuck in `RUNNING`.
+**Invariant:** a worker may publish only while it still owns the current lease generation for the job.
 
 **Code:**
 - `networksecurity/services/training_jobs.py`
 - `networksecurity/services/training_worker.py`
+- `networksecurity/services/model_registry.py`
 
-A worker claims the oldest queued job, records its `worker_id`, increments `attempts`, and receives a bounded lease. A heartbeat extends that lease while training is active. On the next claim transaction, expired jobs are either requeued or failed after the configured attempt limit.
+A worker claim records `worker_id`, increments `attempts`, receives a bounded lease, and is assigned a globally monotonic `fence_token`. Heartbeats require the exact `(job_id, worker_id, fence_token)` tuple and a lease that is still live. Expired jobs are requeued or failed after the configured attempt limit.
 
 The state machine is:
 
 ```mermaid
 flowchart LR
-    Q[QUEUED] -->|claim + lease| R[RUNNING]
-    R -->|success| S[SUCCEEDED]
+    Q[QUEUED] -->|claim + lease + fence| R[RUNNING]
+    R -->|fenced promotion| S[SUCCEEDED]
     R -->|failure| F[FAILED]
     R -->|lease expires; attempts remain| Q
     R -->|lease expires; attempts exhausted| F
 ```
 
-Why this matters: process death, host restart and network/storage faults are normal operational events. A durable job system needs ownership with expiry, not a permanent boolean `running` flag.
+Training and production promotion are intentionally separate. The worker first builds and stages an immutable candidate. It then enters `TrainingJobStore.promote_owned`, which acquires `BEGIN IMMEDIATE`, verifies that the lease and fence are still current, and only then invokes the small local pointer promotion. Because job reclaim also needs `BEGIN IMMEDIATE`, another worker cannot reclaim the job between that ownership check and the pointer swap.
 
-Important limitation: lease recovery creates **at-least-once execution**. A worker can lose its lease after doing external work but before recording completion. Therefore downstream publication must be safe against retries and stale ownership. The current single-writer reference deployment reduces this surface, but a distributed implementation should add promotion fencing or an authoritative outbox/transactional promotion record.
+The model registry independently stores the promotion token in `current.json` and rejects any attempt whose token is not newer than the active pointer. This gives a second line of defense against a stale claim trying to overwrite a newer release.
+
+Why this matters: lease recovery creates **at-least-once execution**. A worker can continue computing after losing ownership. Fencing makes the side effect that matters—production promotion—conditional on the newest claim generation rather than on process identity alone.
+
+Important boundary: SQLite state and the filesystem pointer are still separate resources. A process crash at the exact cross-resource commit boundary can require reconciliation. The current design prevents stale-worker overwrite, but it does not claim a distributed transaction or exactly-once publication.
 
 ## 4. Immutable model bundles and pointer-based promotion
 
@@ -65,17 +70,17 @@ Important limitation: lease recovery creates **at-least-once execution**. A work
 - `networksecurity/services/model_registry.py`
 - `networksecurity/pipeline/training_pipeline.py`
 
-A successful candidate is published into a new immutable `versions/<version>/` directory containing:
+A candidate is first staged into a new immutable `versions/<version>/` directory containing:
 
 - `model.pkl`
 - `preprocessor.pkl`
 - `manifest.json`
 
-The manifest records SHA-256 digests plus schema/feature metadata. The directory is completed and fsynced before the small `current.json` pointer is atomically replaced with `os.replace`.
+The manifest records SHA-256 digests plus schema/feature metadata. Staging completes and fsyncs the directory without changing production. Promotion is a separate fenced operation that atomically replaces the small `current.json` pointer with `os.replace`.
 
 That ordering gives readers a simple rule: the pointer refers only to a complete version. A reader sees either the old complete bundle or the new complete bundle, never a partially updated release.
 
-The optional S3 mirror follows the same logical order: immutable version contents first, pointer last.
+The optional S3 copy is explicitly a mirror, not serving authority. It runs only after the local promotion has committed; mirror failure is logged but does not roll back a production release.
 
 What checksums provide: corruption detection.
 
@@ -122,8 +127,8 @@ The serving image does not need MongoDB, MLflow, boto3 or training orchestration
 
 The current contracts are intentionally replaceable. The main changes would be:
 
-1. Replace SQLite with PostgreSQL for authoritative job/idempotency state and a durable queue for execution.
-2. Add fencing tokens or a transactional outbox so stale workers cannot publish after losing ownership.
+1. Replace SQLite with PostgreSQL or another authoritative transactional store and a durable queue for execution.
+2. Preserve monotonic fencing tokens in the distributed job store and make promotion state authoritative through a transactional outbox or release-controller record.
 3. Replace the filesystem registry with an object-store/model-registry adapter using immutable versions and a strongly controlled promotion record.
 4. Replace admin API keys with workload identity or OAuth/JWT plus network policy.
 5. Make model-promotion notification event-driven instead of polling.
