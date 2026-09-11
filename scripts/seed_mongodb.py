@@ -9,7 +9,11 @@ import pymongo
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed the training collection from a local CSV file")
-    parser.add_argument("--file", default="Network_Data/phishing_data.csv")
+    parser.add_argument(
+        "--file",
+        required=True,
+        help="path to a compatible CSV that you are permitted to use",
+    )
     parser.add_argument(
         "--database",
         default=os.getenv("DATA_INGESTION_DATABASE_NAME", "networksecurity"),
