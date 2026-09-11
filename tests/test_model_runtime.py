@@ -54,12 +54,13 @@ columns:
         "schema_sha256": schema.schema_sha256,
         "feature_names": list(schema.feature_names),
     }
-    registry.publish(
+    registry.stage(
         model_source=str(model_source),
         preprocessor_source=str(preprocessor_source),
         metadata=metadata,
         version="v1",
     )
+    registry.promote("v1", promotion_token=1)
 
     settings = RuntimeSettings(
         model_registry_dir=str(registry_dir),
@@ -73,12 +74,13 @@ columns:
     assert version == "v1"
     assert results[0] == {"prediction": 1, "confidence": 0.9}
 
-    second = registry.publish(
+    second = registry.stage(
         model_source=str(model_source),
         preprocessor_source=str(preprocessor_source),
         metadata=metadata,
         version="v2",
     )
+    registry.promote("v2", promotion_token=2)
     with open(second.model_path, "ab") as handle:
         handle.write(b"corruption")
 
