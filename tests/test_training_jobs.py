@@ -118,3 +118,15 @@ def test_stale_worker_cannot_promote_after_lease_reclaim(tmp_path):
 
     assert promoted == []
     _complete(store, current, "current-model")
+
+
+def test_fence_sequence_can_be_bootstrapped_from_surviving_registry(tmp_path):
+    store = TrainingJobStore(str(tmp_path / "jobs.db"))
+    store.ensure_fence_at_least(41)
+    submitted, _ = store.submit("restored-control-plane")
+
+    claim = store.claim_next("worker-restored", lease_seconds=30)
+
+    assert claim is not None
+    assert claim.job_id == submitted.job_id
+    assert claim.fence_token == 42
