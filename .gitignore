@@ -1,2 +1,37 @@
-venv
+# Environments and secrets
 .env
+.env.*
+!.env.example
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Runtime/training state
+artifacts/
+Artifacts/
+model_registry/
+runtime/
+final_model/
+saved_models/
+logs/
+prediction_output/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

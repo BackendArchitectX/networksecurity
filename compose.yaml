@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY is required}
+      MODEL_REGISTRY_DIR: /state/model_registry
+      TRAINING_JOB_DB_PATH: /state/jobs/training_jobs.db
+      MODEL_REFRESH_INTERVAL_SECONDS: 2
+    volumes:
+      - model_registry:/state/model_registry
+      - training_jobs:/state/jobs
+    restart: unless-stopped
+
+  training-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      MONGO_DB_URL: ${MONGO_DB_URL:?MONGO_DB_URL is required}
+      MODEL_REGISTRY_DIR: /state/model_registry
+      TRAINING_JOB_DB_PATH: /state/jobs/training_jobs.db
+      TRAINING_BUCKET_NAME: ${TRAINING_BUCKET_NAME:-}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-networksecurity}
+    volumes:
+      - model_registry:/state/model_registry
+      - training_jobs:/state/jobs
+    restart: unless-stopped
+
+volumes:
+  model_registry:
+  training_jobs:

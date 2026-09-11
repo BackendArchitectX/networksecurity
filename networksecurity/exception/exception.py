@@ -1,22 +1,25 @@
+from __future__ import annotations
+
 import sys
-from networksecurity.logging import logger
+from types import ModuleType
+
 
 class NetworkSecurityException(Exception):
-    def __init__(self,error_message,error_details:sys):
-        self.error_message = error_message
-        _,_,exc_tb = error_details.exc_info()
+    """Adds source context while preserving the original exception as the cause."""
 
-        self.lineno=exc_tb.tb_lineno
-        self.file_name=exc_tb.tb_frame.f_code.co_filename
+    def __init__(self, error_message: Exception | str, error_details: ModuleType | None = None):
+        super().__init__(str(error_message))
+        self.error_message = str(error_message)
+        self.file_name: str | None = None
+        self.line_number: int | None = None
 
-    def __str__(self):
-        return "Error occured in python script name [{0}] line number [{1}] error message [{2}]".format(
-        self.file_name, self.lineno, str(self.error_message))
+        details = error_details or sys
+        _, _, exc_tb = details.exc_info()
+        if exc_tb is not None:
+            self.line_number = exc_tb.tb_lineno
+            self.file_name = exc_tb.tb_frame.f_code.co_filename
 
-if __name__=='__main__':
-    try:
-        logger.logging.info('Enter the try block')
-        a=1/0
-        print("This will not be printed",a)
-    except Exception as e:
-        raise NetworkSecurityException(e,sys)
+    def __str__(self) -> str:
+        if self.file_name is None or self.line_number is None:
+            return self.error_message
+        return f"{self.file_name}:{self.line_number}: {self.error_message}"
