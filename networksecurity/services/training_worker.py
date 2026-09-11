@@ -9,6 +9,7 @@ from typing import Callable
 
 from networksecurity.config.runtime import RuntimeSettings
 from networksecurity.pipeline.training_pipeline import TrainingPipeline
+from networksecurity.services.model_registry import ModelRegistry
 from networksecurity.services.training_jobs import (
     TrainingJob,
     TrainingJobLeaseError,
@@ -36,6 +37,8 @@ class TrainingWorker:
             max_pending_jobs=settings.max_pending_training_jobs,
             max_attempts=settings.training_job_max_attempts,
         )
+        registry = ModelRegistry(settings.model_registry_dir)
+        self._store.ensure_fence_at_least(registry.current_promotion_token() or 0)
         self._pipeline_factory = pipeline_factory or (lambda: TrainingPipeline(settings))
 
     @property
@@ -77,9 +80,6 @@ class TrainingWorker:
         try:
             candidate = pipeline.prepare_candidate()
 
-            # Training is complete. Stop heartbeats before entering the short fenced
-            # promotion transaction; claim/reclaim cannot proceed while it holds the
-            # SQLite write lock.
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
 
@@ -98,8 +98,6 @@ class TrainingWorker:
             try:
                 pipeline.mirror_promoted(bundle)
             except Exception:
-                # Remote mirroring is explicitly non-authoritative. A mirror outage
-                # must not roll back an already committed local promotion.
                 LOG.exception(
                     "model mirror failed after local promotion",
                     extra={"job_id": job.job_id, "model_version": bundle.version},
