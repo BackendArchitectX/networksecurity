@@ -42,7 +42,8 @@ columns:
         pickle.dump(IdentityPreprocessor(), handle)
 
     registry_dir = tmp_path / "registry"
-    ModelRegistry(str(registry_dir)).publish(
+    registry = ModelRegistry(str(registry_dir))
+    registry.stage(
         model_source=str(model_path),
         preprocessor_source=str(preprocessor_path),
         metadata={
@@ -51,6 +52,7 @@ columns:
         },
         version="api-test-v1",
     )
+    registry.promote("api-test-v1", promotion_token=1)
 
     app = create_app(
         RuntimeSettings(
