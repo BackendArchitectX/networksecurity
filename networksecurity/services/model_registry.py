@@ -30,6 +30,10 @@ class ModelIntegrityError(ModelRegistryError):
     pass
 
 
+class StalePromotionError(ModelRegistryError):
+    pass
+
+
 @dataclass(frozen=True)
 class ModelBundle:
     version: str
@@ -40,11 +44,12 @@ class ModelBundle:
 
 
 class ModelRegistry:
-    """Filesystem-backed immutable model registry with atomic pointer promotion.
+    """Filesystem-backed immutable model registry with fenced pointer promotion.
 
-    Version directories are immutable. Publication first commits a complete bundle,
-    then atomically swaps `current.json`. Readers therefore observe either the old
-    complete version or the new complete version, never a mixed model/preprocessor.
+    Candidate bundles are staged immutably first. Promotion is a separate operation
+    guarded by a monotonically increasing fencing token issued by the durable job
+    store. Readers therefore observe only complete bundles, and an older worker can
+    never overwrite a pointer written by a newer claim generation.
     """
 
     def __init__(self, root_dir: str):
@@ -63,30 +68,34 @@ class ModelRegistry:
     def current_version(self) -> str | None:
         if not self._current.exists():
             return None
-        pointer = _read_json(self._current)
-        version = pointer.get("version")
-        if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
-            raise ModelIntegrityError("current model pointer contains an invalid version")
-        return version
+        pointer = self._read_current_pointer()
+        return pointer["version"]
+
+    def current_promotion_token(self) -> int | None:
+        if not self._current.exists():
+            return None
+        pointer = self._read_current_pointer()
+        return pointer["promotion_token"]
 
     def resolve_current(self) -> ModelBundle:
         if not self._current.exists():
             raise ModelRegistryEmptyError("model registry has no active version")
 
-        pointer = _read_json(self._current)
-        version = pointer.get("version")
-        manifest_relative = pointer.get("manifest")
-        if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
-            raise ModelIntegrityError("current model pointer contains an invalid version")
-        if not isinstance(manifest_relative, str):
-            raise ModelIntegrityError("current model pointer is missing manifest path")
+        pointer = self._read_current_pointer()
+        bundle = self.resolve_version(pointer["version"])
+        expected_manifest = self._safe_registry_path(pointer["manifest"])
+        if Path(bundle.manifest_path).resolve() != expected_manifest.resolve():
+            raise ModelIntegrityError("current model pointer references an unexpected manifest")
+        return bundle
 
-        manifest_path = self._safe_registry_path(manifest_relative)
+    def resolve_version(self, version: str) -> ModelBundle:
+        self._validate_version(version)
+        manifest_path = self._versions / version / "manifest.json"
         manifest = _read_json(manifest_path)
         if manifest.get("schema_version") != _MANIFEST_SCHEMA_VERSION:
             raise ModelIntegrityError("unsupported model manifest schema")
         if manifest.get("version") != version:
-            raise ModelIntegrityError("model pointer and manifest version disagree")
+            raise ModelIntegrityError("model version and manifest version disagree")
 
         bundle_root = manifest_path.parent
         artifacts = manifest.get("artifacts")
@@ -112,7 +121,7 @@ class ModelRegistry:
             manifest_path=str(manifest_path),
         )
 
-    def publish(
+    def stage(
         self,
         *,
         model_source: str,
@@ -120,9 +129,9 @@ class ModelRegistry:
         metadata: dict[str, Any],
         version: str | None = None,
     ) -> ModelBundle:
+        """Create and validate an immutable candidate without making it active."""
         version = version or _new_version()
-        if not _VERSION_PATTERN.fullmatch(version):
-            raise ValueError("model version contains unsupported characters")
+        self._validate_version(version)
 
         model_source_path = Path(model_source)
         preprocessor_source_path = Path(preprocessor_source)
@@ -160,18 +169,51 @@ class ModelRegistry:
 
             os.replace(staging_dir, final_dir)
             _fsync_directory(self._versions)
-
-            pointer = {
-                "version": version,
-                "manifest": f"versions/{version}/manifest.json",
-                "published_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._write_current_pointer(pointer)
-            return self.resolve_current()
+            return self.resolve_version(version)
         except Exception:
             if staging_dir.exists():
                 shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+
+    def promote(self, version: str, *, promotion_token: int) -> ModelBundle:
+        """Atomically advance the active pointer if the fencing token is newest."""
+        if promotion_token < 1:
+            raise ValueError("promotion_token must be a positive integer")
+
+        bundle = self.resolve_version(version)
+        if self._current.exists():
+            current = self._read_current_pointer()
+            if promotion_token <= current["promotion_token"]:
+                raise StalePromotionError(
+                    "promotion token is not newer than the active model pointer"
+                )
+
+        pointer = {
+            "version": version,
+            "manifest": f"versions/{version}/manifest.json",
+            "promotion_token": promotion_token,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._write_current_pointer(pointer)
+        return self.resolve_current()
+
+    def _read_current_pointer(self) -> dict[str, Any]:
+        pointer = _read_json(self._current)
+        version = pointer.get("version")
+        manifest = pointer.get("manifest")
+        promotion_token = pointer.get("promotion_token")
+        if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
+            raise ModelIntegrityError("current model pointer contains an invalid version")
+        if not isinstance(manifest, str):
+            raise ModelIntegrityError("current model pointer is missing manifest path")
+        if not isinstance(promotion_token, int) or promotion_token < 1:
+            raise ModelIntegrityError("current model pointer contains an invalid promotion token")
+        self._safe_registry_path(manifest)
+        return {
+            "version": version,
+            "manifest": manifest,
+            "promotion_token": promotion_token,
+        }
 
     def _write_current_pointer(self, pointer: dict[str, Any]) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
@@ -210,6 +252,11 @@ class ModelRegistry:
         except ValueError as exc:
             raise ModelIntegrityError("manifest path escapes model registry") from exc
         return path
+
+    @staticmethod
+    def _validate_version(version: str) -> None:
+        if not _VERSION_PATTERN.fullmatch(version):
+            raise ValueError("model version contains unsupported characters")
 
 
 def _new_version() -> str:
