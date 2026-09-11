@@ -6,7 +6,7 @@ import pandas as pd
 from networksecurity.components.data_ingestion import DataIngestion
 from networksecurity.components.data_transformation import DataTransformation
 from networksecurity.components.data_validation import DataValidation
-from networksecurity.entity.artifact_entity import DataIngestionArtifact, DataValidationArtifact
+from networksecurity.entity.artifact_entity import DataIngestionArtifact
 from networksecurity.entity.config_entity import (
     DataIngestionConfig,
     DataTransformationConfig,
