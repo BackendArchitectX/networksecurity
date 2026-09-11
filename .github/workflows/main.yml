@@ -44,12 +44,11 @@ jobs:
       - name: Lint correctness rules
         run: ruff check networksecurity app.py worker.py main.py scripts tests --select F,B
 
-      - name: Run tests with branch coverage
+      - name: Run full-package tests with branch coverage
         run: |
           python -m pytest \
-            --cov=networksecurity.api \
-            --cov=networksecurity.services \
-            --cov=networksecurity.config \
+            --cov=networksecurity \
+            --cov-branch \
             --cov-report=term-missing \
             --cov-fail-under=75
 
