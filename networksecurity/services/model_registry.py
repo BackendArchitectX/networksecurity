@@ -180,7 +180,7 @@ class ModelRegistry:
         if promotion_token < 1:
             raise ValueError("promotion_token must be a positive integer")
 
-        bundle = self.resolve_version(version)
+        self.resolve_version(version)
         if self._current.exists():
             current = self._read_current_pointer()
             if promotion_token <= current["promotion_token"]:
@@ -201,8 +201,6 @@ class ModelRegistry:
         pointer = _read_json(self._current)
         version = pointer.get("version")
         manifest = pointer.get("manifest")
-        # Pointers created before fencing existed are treated as generation zero so
-        # the first fenced promotion can migrate them in place without downtime.
         promotion_token = pointer.get("promotion_token", 0)
         if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
             raise ModelIntegrityError("current model pointer contains an invalid version")
